@@ -79,7 +79,7 @@ public enum Authenticator {
                         #endif
                     }
                 )
-                let response = try await client.execute(request: request).get()
+                let response = try await executeWithTransientRetry(client: client, request: request)
                 let result = try parseResponse(
                     response,
                     email: email,
@@ -123,6 +123,36 @@ public enum Authenticator {
             cookies: account.cookie
         )
         account = newAccount
+    }
+
+    /// Apple's edge intermittently answers the authenticate endpoint with an
+    /// empty 204, a 404, a 5xx, or a 3xx without Location even for a valid
+    /// signed request. Resend the identical request a few times before
+    /// treating the response as final. 403 and 429 are never retried.
+    private static func executeWithTransientRetry(
+        client: HTTPClient,
+        request: HTTPClient.Request
+    ) async throws -> HTTPClient.Response {
+        let maxSends = 4
+        var seen: [UInt] = []
+        var response = try await client.execute(request: request).get()
+        while seen.count + 1 < maxSends, isTransientAuthResponse(response) {
+            seen.append(response.status.code)
+            APLogger.info("auth: transient HTTP \(response.status.code), resending (\(seen.count))")
+            try await Task.sleep(nanoseconds: 400_000_000)
+            response = try await client.execute(request: request).get()
+        }
+        if !seen.isEmpty {
+            APLogger.info("auth: statuses before final response: \(seen.map(String.init).joined(separator: ", ")) -> \(response.status.code)")
+        }
+        return response
+    }
+
+    private static func isTransientAuthResponse(_ response: HTTPClient.Response) -> Bool {
+        let code = response.status.code
+        if code == 204 || code == 404 || (500 ... 599).contains(code) { return true }
+        if (300 ... 399).contains(code), response.headers.first(name: "location") == nil { return true }
+        return false
     }
 
     private static func createInitialRequestEndpoint(
