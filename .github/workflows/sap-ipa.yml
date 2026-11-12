@@ -12,13 +12,33 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode
+      - name: Select newest stable Xcode
         run: |
           set -euo pipefail
-          if [ -d /Applications/Xcode_26.2.app ]; then
-            sudo xcode-select -s /Applications/Xcode_26.2.app
+          best_path=""
+          best_ver=""
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            case "$(printf '%s' "$app" | tr '[:upper:]' '[:lower:]')" in
+              *beta*|*_rc*) continue ;;
+            esac
+            ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            [ -n "$ver" ] || continue
+            if [ -z "$best_ver" ] || [ "$(printf '%s\n%s\n' "$best_ver" "$ver" | sort -V | tail -1)" = "$ver" ]; then
+              best_ver="$ver"
+              best_path="$app"
+            fi
+          done
+          if [ -n "$best_path" ]; then
+            echo "Selected Xcode $best_ver at $best_path"
+            sudo xcode-select -s "$best_path"
           fi
           xcodebuild -version
+      - name: Ensure iOS platform is installed
+        run: |
+          if ! xcodebuild -showsdks | grep -q iphoneos; then
+            xcodebuild -downloadPlatform iOS
+          fi
       - name: Prepare verified local SAP runtime
         run: python3 Resources/Scripts/prepare.sap.runtime.py --public-certificates
       - name: Install build formatter
