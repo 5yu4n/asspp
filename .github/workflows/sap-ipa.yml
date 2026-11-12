@@ -1,5 +1,7 @@
 name: SAP iOS IPA
 
+# Temporary branch-only diagnostic: credential-free probe of Apple's
+# authentication endpoints. Sends no Apple ID, password or code.
 on:
   workflow_dispatch:
 
@@ -7,55 +9,44 @@ permissions:
   contents: read
 
 jobs:
-  ipa:
-    runs-on: macos-26
-    timeout-minutes: 45
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: Select newest stable Xcode
+      - name: Probe Apple auth endpoints without credentials
+        shell: python3 {0}
         run: |
-          set -euo pipefail
-          best_path=""
-          best_ver=""
-          for app in /Applications/Xcode*.app; do
-            [ -d "$app" ] || continue
-            case "$(printf '%s' "$app" | tr '[:upper:]' '[:lower:]')" in
-              *beta*|*_rc*) continue ;;
-            esac
-            ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
-            [ -n "$ver" ] || continue
-            if [ -z "$best_ver" ] || [ "$(printf '%s\n%s\n' "$best_ver" "$ver" | sort -V | tail -1)" = "$ver" ]; then
-              best_ver="$ver"
-              best_path="$app"
-            fi
-          done
-          if [ -n "$best_path" ]; then
-            echo "Selected Xcode $best_ver at $best_path"
-            sudo xcode-select -s "$best_path"
-          fi
-          xcodebuild -version
-      - name: Ensure iOS platform is installed
-        run: |
-          if ! xcodebuild -showsdks | grep -q iphoneos; then
-            xcodebuild -downloadPlatform iOS
-          fi
-      - name: Prepare verified local SAP runtime
-        run: python3 Resources/Scripts/prepare.sap.runtime.py --public-certificates
-      - name: Install build formatter
-        run: brew install xcbeautify
-      - name: Verify local WebView signer without credentials
-        env:
-          ASSPP_TEST_APPLE_SAP: "1"
-        run: bash Resources/Scripts/check.sap.webview.sh
-      - name: Compile iOS IPA
-        run: ./Resources/Scripts/compile.release.mobile.ci.sh "$PWD" "$RUNNER_TEMP/Asspp-SAP.ipa"
-      - name: Verify IPA
-        run: python3 Resources/Scripts/verify.sap.ipa.py "$RUNNER_TEMP/Asspp-SAP.ipa"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: Asspp-SAP-IPA
-          if-no-files-found: ignore
-          path: |
-            ${{ runner.temp }}/Asspp-SAP.ipa
-            ${{ runner.temp }}/Asspp-SAP.ipa.sha256
+          import re, time, urllib.request, urllib.error
+          UA = "Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6"
+          ITUNES_UA = "iTunes/12.13 (Macintosh; OS X 15.2) AppleWebKit/620.1.16"
+          GUID = "0A1B2C3D4E5F"
+          KEEP = ("x-responding-instance", "apple-originating-system", "location", "content-type", "x-apple-jingle-correlation-key")
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *a, **k): return None
+          opener = urllib.request.build_opener(NoRedirect)
+          def call(method, url, ua, body=None):
+              req = urllib.request.Request(url, data=body, method=method, headers={"User-Agent": ua, "Content-Type": "application/x-apple-plist"})
+              try:
+                  r = opener.open(req, timeout=30); code, hdrs, data = r.status, r.headers, r.read()
+              except urllib.error.HTTPError as e:
+                  code, hdrs, data = e.code, e.headers, e.read()
+              h = {k: hdrs.get(k) for k in KEEP if hdrs.get(k)}
+              snippet = re.sub(r"\s+", " ", data[:300].decode("utf-8", "replace"))
+              print(f"{method} {url} [{ua.split('/')[0]}] -> {code} {h} body[{len(data)}]: {snippet}")
+              return code, data
+          for ua in (UA, ITUNES_UA):
+              _, bag = call("GET", f"https://init.itunes.apple.com/bag.xml?guid={GUID}", ua)
+              m = re.search(rb"<key>authenticateAccount</key>\s*<string>([^<]+)</string>", bag)
+              print("  authenticateAccount:", m.group(1).decode() if m else None)
+          empty = b'<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict/></plist>'
+          targets = [
+              "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate/",
+              "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate",
+              f"https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate/?guid={GUID}",
+              "https://auth.itunes.apple.com/auth/v1/native/fast",
+          ]
+          for round_ in range(3):
+              print(f"--- round {round_ + 1}")
+              for t in targets:
+                  call("POST", t, UA, empty)
+              time.sleep(5)
